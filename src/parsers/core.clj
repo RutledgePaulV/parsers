@@ -67,7 +67,7 @@
 (defn get-type-hint [s]
   (when (string/includes? s ":")
     (let [hint (keify (.substring s (inc (.lastIndexOf s ":"))))]
-      (first (filter #{::string ::boolean ::number ::date} [hint])))))
+      (some #{::string ::boolean ::number ::date} [hint]))))
 
 (defn get-selector-path [s]
   (mapv keyword (string/split (trim-from-end s ":") #"\.")))
