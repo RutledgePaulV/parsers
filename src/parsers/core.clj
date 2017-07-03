@@ -93,7 +93,7 @@
 (defn coerce-string [s] s)
 
 (defn coerce-boolean [s]
-  (boolean (Boolean/valueOf ^String s)))
+  (case s "true" true "false" false))
 
 (defn coerce-number [s]
   (try
