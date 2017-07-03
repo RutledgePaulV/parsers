@@ -163,7 +163,8 @@
 ;;; predicates
 
 (defn coll-like? [x]
-  (and (not (string? x)) (try (seq x) (catch Exception _))))
+  (and (not (string? x))
+    (try (seq x) (catch Exception _))))
 
 (defn coerce-to-set [x]
   (if (coll-like? x) (set x) #{x}))
@@ -181,22 +182,23 @@
         (map coerce-to-set args)))))
 
 (defn compare-coll [op]
-  (fn [provided value]
-    (if (and (coll-like? provided) (coll-like? value))
-      (op (count provided) (count value))
-      (op (first provided) (first value)))))
+  (fn [& args]
+    (apply op
+      (if (every? coll-like? args)
+        (map count args)
+        (map first args)))))
 
-(defn gt [provided value]
-  ((compare-coll >) provided value))
+(defn gt [& args]
+  (apply (compare-coll >) args))
 
-(defn lt [provided value]
-  ((compare-coll <) provided value))
+(defn lt [& args]
+  (apply (compare-coll <) args))
 
-(defn gte [provided value]
-  ((compare-coll >=) provided value))
+(defn gte [& args]
+  (apply (compare-coll >=) args))
 
-(defn lte [provided value]
-  ((compare-coll <=) provided value))
+(defn lte [& args]
+  (apply (compare-coll <=) args))
 
 (defmulti visit-predicate
   (fn [_ {op :op}] op))
@@ -208,17 +210,16 @@
   (apply every-pred (map (partial visit-predicate context) (:children node))))
 
 (defmethod visit-predicate ::== [node context]
-  (fn [o]
-    (= (get-in o (:path node))
-      (first (:arguments node)))))
+  (fn [o] (= (get-in o (:path node)) (first (:arguments node)))))
 
 (defmethod visit-predicate ::!= [context node]
   (fn [o] (not= (get-in o (:path node)) (first (:arguments node)))))
 
 (defmethod visit-predicate ::=re= [context node]
-  (fn [o] (boolean
-            (re-matches (re-pattern (first (:arguments node)))
-              (name (get-in o (:path node)))))))
+  (fn [o]
+    (boolean
+      (re-matches (re-pattern (first (:arguments node)))
+        (name (get-in o (:path node)))))))
 
 (defmethod visit-predicate ::=in= [context node]
   (fn [o] (in (get-in o (:path node) []) (:arguments node []))))
@@ -253,4 +254,4 @@
 (defn parse-predicate
   ([s] (parse-predicate s {}))
   ([s schema] (parse-predicate s schema {}))
-  ([s schema context] (-> s (parse schema) (visit-predicate context))))
+  ([s schema context] (->> (parse s schema) (visit-predicate context) (comp boolean))))
