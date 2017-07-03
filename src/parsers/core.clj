@@ -90,7 +90,7 @@
 (defn coerce-node [f node]
   (update node :arguments (partial mapv f)))
 
-(defn coerce-string [s] (identity s))
+(defn coerce-string [s] s)
 
 (defn coerce-boolean [s]
   (boolean (Boolean/valueOf ^String s)))
@@ -107,8 +107,7 @@
 
 (defn best-effort [s]
   (letfn [(attempt [s queue]
-            (try
-              ((first queue) s)
+            (try ((first queue) s)
               (catch Exception _
                 (attempt s (rest queue)))))]
     (attempt s [coerce-date coerce-number coerce-boolean coerce-string])))
@@ -157,7 +156,7 @@
 
 (defn parse
   ([s] (parse s {}))
-  ([s schema] (-> s (parse-to-tree) (coerce-argument-types schema))))
+  ([s schema] (-> (parse-to-tree s) (coerce-argument-types schema))))
 
 
 ;;; predicates
