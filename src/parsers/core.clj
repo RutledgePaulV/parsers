@@ -1,13 +1,15 @@
 (ns parsers.core
-  (:require [schema.core :as s]
-            [clojure.string :as string]
-            [clojure.core.memoize :as memo]
+  (:require [clojure.string :as string]
             [clojure.pprint :refer [pprint]]
-            [clojure.set :as sets])
-  (:import (cz.jirutka.rsql.parser.ast RSQLOperators ComparisonOperator Node AndNode OrNode ComparisonNode)
+            [clojure.set :as sets]
+            [clojure.string :as strings]
+            [schema.core :as s])
+  (:import (cz.jirutka.rsql.parser.ast RSQLOperators ComparisonOperator AndNode OrNode ComparisonNode)
            (cz.jirutka.rsql.parser RSQLParser)
            (java.time.format DateTimeFormatter)
-           (java.time Instant)))
+           (java.time Instant)
+           (java.util Date)
+           (org.bson.types ObjectId)))
 
 
 ;;; argument conversion
@@ -105,18 +107,35 @@
   (let [parser (DateTimeFormatter/ISO_DATE_TIME)]
     (Instant/from (.parse parser s))))
 
+(defn coerce-object-id [^String s]
+  (if (and (string? s) (ObjectId/isValid s)) (ObjectId. s) s))
+
 (defn best-effort [s]
   (letfn [(attempt [s queue]
             (try ((first queue) s)
-              (catch Exception _
-                (attempt s (rest queue)))))]
+                 (catch Exception _
+                   (attempt s (rest queue)))))]
     (attempt s [coerce-date coerce-number coerce-boolean coerce-string])))
+
+(defn coercer [schema]
+  (cond
+    (identical? s/Str schema) coerce-string
+    (identical? s/Int schema) coerce-number
+    (identical? s/Inst schema) coerce-date
+    (identical? s/Bool schema) coerce-boolean
+    (identical? s/Num schema) coerce-number
+    (.isAssignableFrom ObjectId schema) coerce-object-id
+    (.isAssignableFrom String schema) coerce-string
+    (.isAssignableFrom Number schema) coerce-number
+    (.isAssignableFrom Boolean schema) coerce-boolean
+    (.isAssignableFrom Date schema) coerce-date
+    (.isAssignableFrom Instant schema) coerce-date))
 
 (defn coerce-guess [n]
   (coerce-node best-effort n))
 
-(defn coerce-schema [n]
-  (coerce-node coerce-string n))
+(defn coerce-schema [schema n]
+  (coerce-node (coercer schema) n))
 
 (defn coerce-hint [n]
   (case (:hint n)
@@ -144,7 +163,7 @@
 (defmethod visit-coercion ::comparison [context n]
   (cond
     (has-type-hint? n) (coerce-hint n)
-    (has-schema? context n) (coerce-schema n)
+    (has-schema? context n) (coerce-schema (get-in (get context :schema) (:path n)) n)
     :else (coerce-guess n)))
 
 (defn coerce-argument-types
@@ -180,24 +199,68 @@
       (apply sets/intersection
         (map coerce-to-set args)))))
 
-(defn compare-coll [op]
-  (fn [& args]
-    (apply op
-      (if (every? coll-like? args)
-        (map count args)
-        (map first args)))))
+(defn compare-coll [op & args]
+  (apply op
+    (if (every? coll-like? args)
+      (map count args)
+      (map first args))))
 
 (defn gt [& args]
-  (apply (compare-coll >) args))
+  (compare-coll > args))
 
 (defn lt [& args]
-  (apply (compare-coll <) args))
+  (compare-coll < args))
 
 (defn gte [& args]
-  (apply (compare-coll >=) args))
+  (compare-coll >= args))
 
 (defn lte [& args]
-  (apply (compare-coll <=) args))
+  (compare-coll <= args))
+
+(defn mongo-path [node]
+  (strings/join "." (map name (:path node))))
+
+(defmulti visit-mongo
+  (fn [_ {op :op}] op))
+
+(defmethod visit-mongo ::or [context node]
+  {"$or" (mapv (partial visit-mongo context) (:children node))})
+
+(defmethod visit-mongo ::and [context node]
+  {"$and" (mapv (partial visit-mongo context) (:children node))})
+
+(defmethod visit-mongo ::== [context node]
+  {(mongo-path node) (first (:arguments node))})
+
+(defmethod visit-mongo ::!= [context node]
+  {(mongo-path node) {"$ne" (first (:arguments node))}})
+
+(defmethod visit-mongo ::=re= [context node]
+  {(mongo-path node) {"$regex" (first (:arguments node))}})
+
+(defmethod visit-mongo ::=in= [context node]
+  {(mongo-path node) {"$in" (:arguments node [])}})
+
+(defmethod visit-mongo ::=out= [context node]
+  {(mongo-path node) {"$nin" (:arguments node [])}})
+
+(defmethod visit-mongo ::=gt= [context node]
+  {(mongo-path node) {"$gt" (first (:arguments node []))}})
+
+(defmethod visit-mongo ::=lt= [context node]
+  {(mongo-path node) {"$lt" (first (:arguments node []))}})
+
+(defmethod visit-mongo ::=gte= [context node]
+  {(mongo-path node) {"$gte" (first (:arguments node []))}})
+
+(defmethod visit-mongo ::=lte= [context node]
+  {(mongo-path node) {"$lte" (first (:arguments node []))}})
+
+(defmethod visit-mongo ::=ex= [context node]
+  {(mongo-path node) {"$exists" (first (:arguments node []))}})
+
+(defmethod visit-mongo ::=q= [context node]
+  {(mongo-path node) {"$elemMatch" (visit-mongo context (first (:arguments node)))}})
 
 (defmulti visit-predicate
   (fn [_ {op :op}] op))
@@ -208,7 +271,7 @@
 (defmethod visit-predicate ::and [context node]
   (apply every-pred (map (partial visit-predicate context) (:children node))))
 
-(defmethod visit-predicate ::== [node context]
+(defmethod visit-predicate ::== [context node]
   (fn [o] (= (get-in o (:path node)) (first (:arguments node)))))
 
 (defmethod visit-predicate ::!= [context node]
@@ -245,12 +308,15 @@
       (nil? (get-in o (:path node))))))
 
 (defmethod visit-predicate ::=q= [context node]
-  (fn [o]
-    ((visit-predicate context
-       (first (:arguments node)))
-      (get-in o (:path node)))))
+  (let [inner (visit-predicate context (first (:arguments node)))]
+    (fn [o] (inner (get-in o (:path node))))))
 
 (defn parse-predicate
   ([s] (parse-predicate s {}))
   ([s schema] (parse-predicate s schema {}))
   ([s schema context] (->> (parse s schema) (visit-predicate context) (comp boolean))))
+
+(defn parse-mongodb
+  ([s] (parse-mongodb s {}))
+  ([s schema] (parse-mongodb s schema {}))
+  ([s schema context] (->> (parse s schema) (visit-mongo context))))
